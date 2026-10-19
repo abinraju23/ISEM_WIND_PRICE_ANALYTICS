@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Rebuilt from data/raw by build_dataset.py and load_prices.py
+isem.db
+
+# Synthetic chart used only to smoke-test the pipeline. Never publish it.
+_SAMPLE_CHART_synthetic_prices_DELETE_ME.svg
+
+# data/raw/ IS committed on purpose: the EirGrid endpoint is undocumented and may change,
+# so the cached responses are what makes the analysis reproducible later.

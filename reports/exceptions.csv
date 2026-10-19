@@ -1,0 +1,9 @@
+effective_time,field,value,rule,source_file
+29-Mar-2026 01:00:00,WIND_ACTUAL,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:15:00,WIND_ACTUAL,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:30:00,WIND_ACTUAL,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:45:00,WIND_ACTUAL,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:00:00,SYSTEM_DEMAND,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:15:00,SYSTEM_DEMAND,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:30:00,SYSTEM_DEMAND,None,null value,eirgrid_2026-03.json
+29-Mar-2026 01:45:00,SYSTEM_DEMAND,None,null value,eirgrid_2026-03.json
