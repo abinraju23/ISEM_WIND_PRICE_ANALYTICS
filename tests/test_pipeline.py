@@ -162,6 +162,74 @@ class PriceParsingTests(unittest.TestCase):
 
 
 class TimeAndStatisticsTests(unittest.TestCase):
+    def test_main_reports_demand_and_gas_adjusted_model(self):
+        rng = random.Random(5)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "isem.db")
+            chart_path = os.path.join(temp_dir, "wind_vs_price.svg")
+            with closing(sqlite3.connect(db_path)) as conn:
+                with conn:
+                    conn.execute(
+                        "CREATE TABLE system_15min "
+                        "(effective_time TEXT, wind_mw REAL, demand_mw REAL)"
+                    )
+                    conn.execute(
+                        "CREATE TABLE dam_price_30min (utc_time TEXT, eur_per_mwh REAL)"
+                    )
+                    conn.execute(
+                        "CREATE TABLE gas_price_monthly (month TEXT, usd_per_mmbtu REAL)"
+                    )
+                    gas_by_month = {
+                        "2025-10": 10.0,
+                        "2025-11": 12.0,
+                        "2025-12": 14.0,
+                        "2026-01": 16.0,
+                    }
+                    conn.executemany(
+                        "INSERT INTO gas_price_monthly VALUES (?, ?)",
+                        gas_by_month.items(),
+                    )
+                    system_rows = []
+                    price_rows = []
+                    for month in gas_by_month:
+                        year, month_number = (int(part) for part in month.split("-"))
+                        for day in (5, 12, 19):
+                            utc = dt.datetime(
+                                year, month_number, day, 12, tzinfo=dt.timezone.utc
+                            )
+                            local = utc.astimezone(join_and_chart.DUBLIN).replace(
+                                tzinfo=None
+                            )
+                            wind = rng.uniform(1000, 5000)
+                            demand = rng.uniform(3000, 7000)
+                            gas = gas_by_month[month]
+                            price = 80 - 0.01 * wind + 0.02 * demand + 2.5 * gas
+                            for quarter in (0, 15):
+                                stamp = local + dt.timedelta(minutes=quarter)
+                                system_rows.append(
+                                    (stamp.strftime("%Y-%m-%d %H:%M:%S"), wind, demand)
+                                )
+                            price_rows.append(
+                                (utc.strftime("%Y-%m-%d %H:%M:%S"), price)
+                            )
+                    conn.executemany(
+                        "INSERT INTO system_15min VALUES (?, ?, ?)", system_rows
+                    )
+                    conn.executemany(
+                        "INSERT INTO dam_price_30min VALUES (?, ?)", price_rows
+                    )
+
+            output = io.StringIO()
+            with mock.patch.object(join_and_chart, "DB", db_path), \
+                    mock.patch.object(join_and_chart, "CHART", chart_path), \
+                    redirect_stdout(output):
+                join_and_chart.main()
+
+            self.assertRegex(output.getvalue(), r"adjusted_model_joined\s+12")
+            self.assertIn("Wind:   -10.00 EUR/MWh per 1,000 MW", output.getvalue())
+            self.assertIn("Demand: +20.00 EUR/MWh per 1,000 MW", output.getvalue())
+            self.assertIn("Gas:    +2.50 EUR/MWh per $1/MMBtu", output.getvalue())
+
     def test_main_averages_wind_quarters_and_joins_matching_prices(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = os.path.join(temp_dir, "isem.db")
