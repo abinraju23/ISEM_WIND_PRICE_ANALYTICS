@@ -70,7 +70,9 @@ def parse_date(text):
 
 def parse_line(line):
     """Return (naive_datetime, price) or None if the line is not a data row."""
-    parts = [p for p in SPLIT.split(line.strip()) if p]
+    text = line.strip()
+    parts = ([p.strip() for p in text.split('\t') if p.strip()]
+             if '\t' in text else [p for p in SPLIT.split(text) if p])
     if len(parts) < 3:
         return None
 

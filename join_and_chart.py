@@ -55,15 +55,15 @@ def local_to_utc(naive):
 
     Returns (utc_datetime, None) when unambiguous, or (None, reason) when it is not.
     """
-    first = naive.replace(tzinfo=DUBLIN, fold=0)
-    second = naive.replace(tzinfo=DUBLIN, fold=1)
-    if first.utcoffset() != second.utcoffset():
-        return None, 'ambiguous_clock_back'
-    utc = first.astimezone(timezone.utc)
-    # A local time that does not exist (spring forward) does not round-trip.
-    if utc.astimezone(DUBLIN).replace(tzinfo=None) != naive:
+    candidates = [naive.replace(tzinfo=DUBLIN, fold=fold) for fold in (0, 1)]
+    valid = [candidate for candidate in candidates
+             if candidate.astimezone(timezone.utc).astimezone(DUBLIN).replace(tzinfo=None)
+             == naive]
+    if not valid:
         return None, 'nonexistent_clock_forward'
-    return utc, None
+    if len(valid) > 1 and valid[0].utcoffset() != valid[1].utcoffset():
+        return None, 'ambiguous_clock_back'
+    return valid[0].astimezone(timezone.utc), None
 
 
 # ---------------------------------------------------------------- statistics
@@ -79,6 +79,74 @@ def pearson(xs, ys):
     if sxx == 0 or syy == 0:
         return None
     return sxy / math.sqrt(sxx * syy)
+
+
+def multiple_regression(rows):
+    """Fit price on wind, demand and monthly gas price using standardized normal equations."""
+    if len(rows) <= 4:
+        raise ValueError('need more than four joined periods to fit three predictors')
+
+    names = ('wind', 'demand', 'gas')
+    columns = [list(column) for column in zip(*(row[:3] for row in rows))]
+    prices = [row[3] for row in rows]
+    means = [sum(column) / len(column) for column in columns]
+    scales = [math.sqrt(sum((value - mean) ** 2 for value in column) / len(column))
+              for column, mean in zip(columns, means)]
+    for name, scale in zip(names, scales):
+        if scale == 0:
+            raise ValueError('%s does not vary across the joined periods' % name)
+
+    price_mean = sum(prices) / len(prices)
+    price_scale = math.sqrt(sum((price - price_mean) ** 2 for price in prices) / len(prices))
+    if price_scale == 0:
+        raise ValueError('price does not vary across the joined periods')
+
+    standardized = [
+        [(value - mean) / scale for value in column]
+        for column, mean, scale in zip(columns, means, scales)
+    ]
+    standardized_prices = [(price - price_mean) / price_scale for price in prices]
+    gram = [
+        [sum(x * y for x, y in zip(left, right)) for right in standardized]
+        for left in standardized
+    ]
+    rhs = [sum(x * y for x, y in zip(column, standardized_prices))
+           for column in standardized]
+
+    size = len(gram)
+    matrix = [gram[row][:] + [rhs[row]] for row in range(size)]
+    threshold = len(rows) * 1e-12
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(matrix[row][column]))
+        if abs(matrix[pivot][column]) <= threshold:
+            raise ValueError('wind, demand and gas are too collinear to separate reliably')
+        matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+        pivot_value = matrix[column][column]
+        for index in range(column, size + 1):
+            matrix[column][index] /= pivot_value
+        for row in range(size):
+            if row == column:
+                continue
+            factor = matrix[row][column]
+            for index in range(column, size + 1):
+                matrix[row][index] -= factor * matrix[column][index]
+
+    standardized_coefficients = [matrix[row][-1] for row in range(size)]
+    coefficients = [
+        coefficient * price_scale / scale
+        for coefficient, scale in zip(standardized_coefficients, scales)
+    ]
+    intercept = price_mean - sum(coefficient * mean
+                                 for coefficient, mean in zip(coefficients, means))
+    predictions = [
+        intercept + sum(coefficient * value
+                        for coefficient, value in zip(coefficients, row[:3]))
+        for row in rows
+    ]
+    residual_sum = sum((actual - predicted) ** 2
+                       for actual, predicted in zip(prices, predictions))
+    total_sum = sum((actual - price_mean) ** 2 for actual in prices)
+    return intercept, coefficients, 1.0 - residual_sum / total_sum
 
 
 def deciles(pairs):
@@ -216,49 +284,83 @@ def main():
                 sys.exit('table %s missing — run %s first'
                          % (needed, 'build_dataset.py' if needed == 'system_15min'
                             else 'load_prices.py'))
+        if 'gas_price_monthly' not in tables:
+            sys.exit('table gas_price_monthly missing — run load_gas_prices.py first')
         wind_rows = conn.execute(
-            'SELECT effective_time, wind_mw FROM system_15min '
-            'WHERE wind_mw IS NOT NULL ORDER BY effective_time').fetchall()
+            'SELECT effective_time, wind_mw, demand_mw FROM system_15min '
+            'WHERE wind_mw IS NOT NULL OR demand_mw IS NOT NULL '
+            'ORDER BY effective_time').fetchall()
         price_rows = conn.execute(
             'SELECT utc_time, eur_per_mwh FROM dam_price_30min ORDER BY utc_time').fetchall()
+        gas_rows = conn.execute(
+            'SELECT month, usd_per_mmbtu FROM gas_price_monthly ORDER BY month').fetchall()
     finally:
         conn.close()
 
     counts = defaultdict(int)
 
     # Local -> UTC, excluding what cannot be placed on the clock.
-    quarters = {}
-    for text, value in wind_rows:
+    wind_quarters = {}
+    demand_quarters = {}
+    for text, wind, demand in wind_rows:
         naive = datetime.strptime(text, '%Y-%m-%d %H:%M:%S')
         utc, reason = local_to_utc(naive)
         if utc is None:
             counts[reason] += 1
             continue
-        quarters[utc] = value
-    counts['wind_quarters_placed'] = len(quarters)
+        if wind is not None:
+            wind_quarters[utc] = wind
+        if demand is not None:
+            demand_quarters[utc] = demand
+    counts['wind_quarters_placed'] = len(wind_quarters)
+    counts['demand_quarters_placed'] = len(demand_quarters)
 
     # Average wind up to half-hours, requiring both quarters.
     halves = {}
-    for utc, value in quarters.items():
+    for utc, value in wind_quarters.items():
         if utc.minute in (0, 30):
             mate = utc + timedelta(minutes=15)
-            if mate in quarters:
-                halves[utc] = (value + quarters[mate]) / 2.0
+            if mate in wind_quarters:
+                halves[utc] = (value + wind_quarters[mate]) / 2.0
             else:
                 counts['halfhour_dropped_missing_quarter'] += 1
     counts['wind_halfhours'] = len(halves)
 
+    demand_halves = {}
+    for utc, value in demand_quarters.items():
+        if utc.minute in (0, 30):
+            mate = utc + timedelta(minutes=15)
+            if mate in demand_quarters:
+                demand_halves[utc] = (value + demand_quarters[mate]) / 2.0
+            else:
+                counts['demand_halfhour_dropped_missing_quarter'] += 1
+    counts['demand_halfhours'] = len(demand_halves)
+
     prices = {datetime.strptime(t, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc): p
               for t, p in price_rows}
     counts['price_halfhours'] = len(prices)
+    gas_prices = dict(gas_rows)
 
-    pairs = sorted((halves[k], prices[k]) for k in set(halves) & set(prices))
+    wind_price_times = set(halves) & set(prices)
+    pairs = sorted((halves[k], prices[k]) for k in wind_price_times)
     counts['joined'] = len(pairs)
+    model_rows = []
+    for timestamp in sorted(wind_price_times & set(demand_halves)):
+        month = timestamp.astimezone(DUBLIN).strftime('%Y-%m')
+        if month not in gas_prices:
+            counts['half_hours_without_monthly_gas'] += 1
+            continue
+        model_rows.append((halves[timestamp], demand_halves[timestamp],
+                           gas_prices[month], prices[timestamp]))
+    counts['adjusted_model_joined'] = len(model_rows)
 
     print('Join on UTC half-hours')
-    for key in ('wind_quarters_placed', 'ambiguous_clock_back', 'nonexistent_clock_forward',
-                'halfhour_dropped_missing_quarter', 'wind_halfhours', 'price_halfhours',
-                'joined'):
+    for key in ('wind_quarters_placed', 'demand_quarters_placed',
+                'ambiguous_clock_back', 'nonexistent_clock_forward',
+                'halfhour_dropped_missing_quarter',
+                'demand_halfhour_dropped_missing_quarter', 'wind_halfhours',
+                'demand_halfhours', 'price_halfhours', 'joined',
+                'half_hours_without_monthly_gas', 'adjusted_model_joined'):
         print('  %-34s %d' % (key, counts[key]))
 
     if counts['ambiguous_clock_back']:
@@ -287,15 +389,32 @@ def main():
         print('Highest-wind decile mean price %.2f' % trend[-1][1])
         print('Difference                     %.2f EUR/MWh' % (trend[-1][1] - trend[0][1]))
 
+    print('\nLinear price model (wind + demand + monthly European gas proxy)')
+    try:
+        intercept, coefficients, r_squared = multiple_regression(model_rows)
+    except ValueError as exc:
+        print('  Not calculated: %s' % exc)
+    else:
+        print('  Wind:   %+.2f EUR/MWh per 1,000 MW, holding demand and gas constant'
+              % (coefficients[0] * 1000.0))
+        print('  Demand: %+.2f EUR/MWh per 1,000 MW, holding wind and gas constant'
+              % (coefficients[1] * 1000.0))
+        print('  Gas:    %+.2f EUR/MWh per $1/MMBtu, holding wind and demand constant'
+              % coefficients[2])
+        print('  R-squared: %.3f over %d matched half-hours'
+              % (r_squared, len(model_rows)))
+        print('  Intercept: %.2f EUR/MWh' % intercept)
+
     span = '%s to %s UTC' % (min(set(halves) & set(prices)), max(set(halves) & set(prices)))
     subtitle = ('%d half-hours, %s. Wind: EirGrid Smart Grid Dashboard (15-min, averaged to '
                 '30-min). Price: SEMOpx day-ahead.' % (len(pairs), span))
     os.makedirs(REPORTS, exist_ok=True)
     svg_scatter(pairs, trend, r, CHART, subtitle)
     print('\nWrote %s' % CHART)
-    print('\nWhat this does NOT establish: it is an association over one window in one season, '
-          'not a causal estimate and not a forecast. Gas price, demand, interconnector flows '
-          'and plant availability all move price and none of them is in this chart.')
+    print('\nThe chart is an unadjusted association. The linear model adjusts for demand and a '
+          'monthly European gas-price proxy, but it is not causal and not a forecast. It does '
+          'not account for plant availability, interconnector flows, or time-dependent '
+          'uncertainty; the monthly gas proxy cannot explain half-hourly gas-market movements.')
 
 
 if __name__ == '__main__':
